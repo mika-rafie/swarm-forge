@@ -1131,3 +1131,64 @@
         (fs/delete-tree base)
         (fs/delete-tree packs)))))
 
+
+(defn claude-link-fixture
+  "A project whose .claude is a symlink to a settings folder outside the
+  workspace, plus one git worktree, mirroring how a swarm role is laid out."
+  []
+  (let [base (tmp-dir)
+        root (fs/path base "project")
+        external (fs/path base "external-claude")
+        worktree (fs/path root ".worktrees" "coder")]
+    (fs/create-dirs root)
+    (init-repo! root)
+    (write-file (fs/path external "settings.json") "{\"env\":{\"ANTHROPIC_BASE_URL\":\"https://example.test\"}}\n")
+    (fs/create-sym-link (fs/path root ".claude") external)
+    (run {:dir root} "git" "worktree" "add" "-q" "-B" "swarmforge-coder" (str worktree) "HEAD")
+    {:base base :root root :external external :worktree worktree}))
+
+(deftest worktree-gets-symlink-to-main-checkout-claude-settings
+  (let [{:keys [base root worktree]} (claude-link-fixture)]
+    (try
+      (let [result (run {:dir root} (script "swarmforge.bb") "--test-link-claude-dir"
+                        (str root) (str worktree))
+            link (fs/path worktree ".claude")]
+        (is (= "linked" (str/trim (:out result))))
+        (is (fs/sym-link? link))
+        (is (= (str (fs/path root ".claude")) (str (fs/read-link link))))
+        (is (str/includes? (slurp (str (fs/path link "settings.json"))) "ANTHROPIC_BASE_URL")))
+      (finally
+        (fs/delete-tree base)))))
+
+(deftest symlinked-claude-settings-stay-out-of-git
+  (let [{:keys [base root worktree]} (claude-link-fixture)]
+    (try
+      (run {:dir root} (script "swarmforge.bb") "--test-link-claude-dir" (str root) (str worktree))
+      (is (not (str/includes? (:out (run {:dir root} "git" "status" "--porcelain")) ".claude")))
+      (is (not (str/includes? (:out (run {:dir worktree} "git" "status" "--porcelain")) ".claude")))
+      (finally
+        (fs/delete-tree base)))))
+
+(deftest real-claude-directory-in-worktree-is-left-alone
+  (let [{:keys [base root worktree]} (claude-link-fixture)]
+    (try
+      (write-file (fs/path worktree ".claude" "settings.json") "{}\n")
+      (let [result (run {:dir root} (script "swarmforge.bb") "--test-link-claude-dir"
+                        (str root) (str worktree))]
+        (is (str/includes? (:out result) "kept"))
+        (is (not (fs/sym-link? (fs/path worktree ".claude"))))
+        (is (= "{}\n" (slurp (str (fs/path worktree ".claude" "settings.json"))))))
+      (finally
+        (fs/delete-tree base)))))
+
+(deftest broken-claude-symlink-is-reported-not-linked
+  (let [{:keys [base root external worktree]} (claude-link-fixture)]
+    (try
+      (fs/delete-tree external)
+      (let [result (run {:dir root} (script "swarmforge.bb") "--test-link-claude-dir"
+                        (str root) (str worktree))]
+        (is (str/includes? (:out result) "broken symlink"))
+        (is (str/includes? (:out result) "absent"))
+        (is (not (fs/sym-link? (fs/path worktree ".claude")))))
+      (finally
+        (fs/delete-tree base)))))

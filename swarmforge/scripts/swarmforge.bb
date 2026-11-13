@@ -113,11 +113,33 @@
         (ensure-in-file! gitignore ".swarmforge/")
         (ensure-in-file! gitignore ".worktrees/")))))
 
+(defn git-exclude-file [ctx]
+  (let [path (fs/path (sh-out "git" "-C" (str (:working-dir ctx)) "rev-parse" "--git-path" "info/exclude"))]
+    (if (fs/absolute? path)
+      path
+      (fs/path (:working-dir ctx) path))))
+
+(defn claude-settings-dir [ctx]
+  (fs/path (:working-dir ctx) ".claude"))
+
+(defn claude-settings-dir-present? [ctx]
+  (let [dir (claude-settings-dir ctx)]
+    (or (fs/exists? dir) (fs/sym-link? dir))))
+
+(defn claude-settings-dir-tracked? [ctx]
+  (not (str/blank? (sh-out "git" "-C" (str (:working-dir ctx)) "ls-files" "--" ".claude"))))
+
 (defn ensure-runtime-git-excludes! [ctx]
-  (let [exclude-file (fs/path (sh-out "git" "-C" (str (:working-dir ctx)) "rev-parse" "--git-path" "info/exclude"))]
+  (let [exclude-file (git-exclude-file ctx)]
     (fs/create-dirs (fs/parent exclude-file))
     (ensure-in-file! exclude-file ".swarmforge/")
-    (ensure-in-file! exclude-file ".worktrees/")))
+    (ensure-in-file! exclude-file ".worktrees/")
+    ;; An untracked .claude (often a symlink to settings kept outside the
+    ;; workspace) is shared into every worktree as a symlink. A trailing-slash
+    ;; pattern does not match a symlink, so exclude the bare path.
+    (when (and (claude-settings-dir-present? ctx)
+               (not (claude-settings-dir-tracked? ctx)))
+      (ensure-in-file! exclude-file "/.claude"))))
 
 (defn initialize-git-repo! [ctx]
   (when-not (fs/exists? (fs/path (:working-dir ctx) ".git"))
@@ -352,6 +374,35 @@
              (fs/path worktree-path "swarmforge" "constitution.prompt")
              {:replace-existing true})))
 
+(defn link-worktree-claude-dir!
+  "Give a worktree the main checkout's .claude (settings.json, BYOK env, etc.)
+  by symlinking to it. Links point at the main checkout's .claude path, so
+  re-pointing that symlink retargets every worktree. A real .claude directory
+  in the worktree (for example one committed to the repo) is left alone."
+  [ctx worktree-path]
+  (let [source (claude-settings-dir ctx)
+        target (fs/path worktree-path ".claude")]
+    (cond
+      (not (fs/exists? source))
+      (do (when (fs/sym-link? source)
+            (println (str yellow "Warning:" reset " " source
+                          " is a broken symlink; agents will start without its settings.")))
+          :absent)
+
+      (fs/sym-link? target)
+      (do (fs/delete target)
+          (fs/create-sym-link target source)
+          :linked)
+
+      (fs/exists? target)
+      (do (println (str yellow "Warning:" reset " " target
+                        " already exists and is not a symlink; leaving it in place."))
+          :kept)
+
+      :else
+      (do (fs/create-sym-link target source)
+          :linked))))
+
 (defn sync-worktree-scripts! [ctx]
   (doseq [row (:roles ctx)
           :let [worktree-path (:worktree-path row)]
@@ -365,6 +416,7 @@
             (fs/copy-tree entry target {:replace-existing true})
             (fs/copy entry target {:replace-existing true}))))
       (sync-worktree-roles! ctx worktree-path)
+      (link-worktree-claude-dir! ctx worktree-path)
       (fs/create-dirs (fs/path role-state-dir "notify"))
       (fs/copy (:sessions-file ctx) (fs/path role-state-dir "sessions.tsv") {:replace-existing true})
       (fs/copy (:roles-file ctx) (fs/path role-state-dir "roles.tsv") {:replace-existing true})
@@ -1023,6 +1075,11 @@
       (spit (str (fs/path (:roles-dir ctx) "lieutenant.prompt")) "lieutenant\n"))
     (println (launch-command ctx 1 row))))
 
+(defn test-link-claude-dir! [root worktree]
+  (let [ctx (context root)]
+    (ensure-runtime-git-excludes! ctx)
+    (println (name (link-worktree-claude-dir! ctx (fs/path worktree))))))
+
 (defn test-install-hooks! [root]
   (let [ctx (context root)]
     (install-commit-msg-hook! ctx)
@@ -1054,6 +1111,7 @@
     "--test-lieutenant-launch-command" (test-lieutenant-launch-command!
                                         (or (second args) (System/getProperty "user.dir")))
     "--test-install-hooks" (test-install-hooks! (second args))
+    "--test-link-claude-dir" (test-link-claude-dir! (second args) (nth args 2))
     "--test-agent-start-delay" (println (env-long "SWARMFORGE_AGENT_START_DELAY_MS" 1500))
     "--test-sleep-inhibitor-prefix" (test-sleep-inhibitor-prefix!)
     "--test-ensure-codex-trust" (test-ensure-codex-trust! (second args))
