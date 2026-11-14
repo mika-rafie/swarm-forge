@@ -670,12 +670,28 @@
               (str (ensure-newline text)
                    "\n" header "\ntrust_level = \"trusted\"\n"))))))
 
+(defn launch-script-file [ctx row]
+  (fs/path (:state-dir ctx) "launch" (str (:role row) ".zsh")))
+
+(defn launch-keys
+  "Writes the role's launch command to a zsh script and returns the short line
+  typed into its tmux pane. Typing the full command directly broke in two ways:
+  a pane whose login shell is bash rejects its zsh syntax (`&!`), and a pane
+  still starting up truncates typed lines at 1024 characters."
+  [ctx index row]
+  (let [file (launch-script-file ctx row)]
+    (fs/create-dirs (fs/parent file))
+    (spit (str file) (str "#!/usr/bin/env zsh\n" (launch-command ctx index row) "\n"))
+    ;; The first role's command ends by exiting its shell; exec keeps that
+    ;; closing the pane. Other roles return to the pane's shell as before.
+    (str (when (= index 0) "exec ") "zsh " (sq (str file)))))
+
 (defn launch-role! [ctx index row]
   (when (= "codex" (:agent row))
     (ensure-codex-trust! (:worktree-path row)))
   (let [session (:session row)
         display (:display-name row)
-        command (launch-command ctx index row)]
+        command (launch-keys ctx index row)]
     (sh "tmux" "-S" (:tmux-socket ctx) "send-keys" "-t"
         (tmux-agent-target display (:tmux-pane-base-index ctx) session)
         command "Enter")
@@ -1151,6 +1167,13 @@
     (println (:agent row))
     (println (launch-command ctx 1 row))))
 
+(defn test-launch-keys! [root index]
+  (let [ctx (assoc (prepare-ctx (context root)) :terminal-backend "none")
+        row (first (:roles ctx))]
+    (fs/create-dirs (:prompts-dir ctx))
+    (println (launch-keys ctx (parse-long index) row))
+    (println (str (launch-script-file ctx row)))))
+
 (defn test-lieutenant-launch-command! [root]
   (let [ctx (assoc (context root) :terminal-backend "none")
         row (assoc (lieutenant-row ctx) :worktree-path (fs/path root))]
@@ -1198,6 +1221,7 @@
     "--test-install-hooks" (test-install-hooks! (second args))
     "--test-link-claude-dir" (test-link-claude-dir! (second args) (nth args 2))
     "--test-forge-root" (println (forge-root? (second args)))
+    "--test-launch-keys" (test-launch-keys! (second args) (nth args 2))
     "--test-role-launch-command" (test-role-launch-command! (second args) (nth args 2))
     "--test-agent-start-delay" (println (env-long "SWARMFORGE_AGENT_START_DELAY_MS" 1500))
     "--test-sleep-inhibitor-prefix" (test-sleep-inhibitor-prefix!)

@@ -1304,3 +1304,27 @@
         (is (str/includes? out "claude --append-system-prompt-file")))
       (finally
         (fs/delete-tree root)))))
+
+(deftest roles-launch-through-a-short-command-and-a-zsh-script
+  (let [base (tmp-dir)
+        root (apply fs/path base (repeat 8 "a-long-directory-name-for-the-project"))]
+    (try
+      (fs/create-dirs root)
+      (write-file (fs/path root "swarmforge/constitution.prompt") "Read articles.\n")
+      (write-file (fs/path root "swarmforge/swarmforge.conf")
+                  "window coder claude master\nwindow cleaner claude cleaner\n")
+      (doseq [role ["coder" "cleaner"]]
+        (write-file (fs/path root "swarmforge/roles" (str role ".prompt")) (str role "\n")))
+      (let [[keys0 file] (str/split-lines (:out (run {:dir root} (script "swarmforge.bb")
+                                                     "--test-launch-keys" (str root) "0")))
+            [keys1] (str/split-lines (:out (run {:dir root} (script "swarmforge.bb")
+                                                "--test-launch-keys" (str root) "1")))
+            body (slurp file)]
+        (is (= (str "exec zsh '" file "'") keys0))
+        (is (= (str "zsh '" file "'") keys1))
+        (is (< (count keys0) 1024))
+        (is (> (count body) 1024))
+        (is (str/includes? body "claude --append-system-prompt-file"))
+        (is (zero? (:exit (run {:dir root} "zsh" "-n" file)))))
+      (finally
+        (fs/delete-tree base)))))
