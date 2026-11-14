@@ -105,6 +105,42 @@ window[-invisible] <role> <backend> <worktree> [task|batch] [forward-only|back-o
   merge-only copies for earlier roles after downstream work.
 - Supported backends are `codex`, `grok`, `claude`, and `copilot`; remaining
   tokens are passed to that backend.
+- A backend of `default` uses the backend named by the
+  `SWARMFORGE_DEFAULT_AGENT` environment variable, for example
+  `export SWARMFORGE_DEFAULT_AGENT=claude`. Startup fails if a role says
+  `default` and the variable is not set. A forge lieutenant without a backend
+  of its own also falls back to this variable, after
+  `SWARMFORGE_LIEUTENANT_AGENT`.
+- `provider=NAME` on a `claude` role launches it with
+  `--settings .claude/providers/NAME.json`, layered over the project's
+  `.claude/settings.json`. Use it to send one role to a different model
+  provider. The token may appear anywhere after the worktree.
+
+### Claude settings and your own API key
+
+If the project has a `.claude` directory, or a `.claude` symlink to a folder
+kept outside the workspace, each role worktree gets a `.claude` symlink back to
+it, so every Claude role loads the same `settings.json`. An untracked `.claude`
+is added to `.git/info/exclude` so agents cannot commit it. A worktree that
+already has a real `.claude` directory keeps it.
+
+To use your own key with another Anthropic-compatible provider, put the
+endpoint and model names in that `settings.json` under `env`, and fetch the key
+from the macOS Keychain with `apiKeyHelper`:
+
+```json
+{
+  "apiKeyHelper": "security find-generic-password -s swarmforge-deepseek -w",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+    "ANTHROPIC_MODEL": "deepseek-v4-pro[1m]"
+  }
+}
+```
+
+Provider profiles for `provider=NAME` live beside it in
+`.claude/providers/NAME.json` and use the same format. A profile adds to the
+project settings, so set every key the role needs to override.
 
 Forge hosts instead use `Lieutenant <backend> [backend arguments...]`.
 Branches may extend the grammar for their own control plane—for example,

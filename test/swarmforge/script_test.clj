@@ -1192,3 +1192,115 @@
         (is (not (fs/sym-link? (fs/path worktree ".claude")))))
       (finally
         (fs/delete-tree base)))))
+
+(deftest project-with-its-own-packs-directory-is-not-a-forge
+  (let [root (tmp-dir)]
+    (try
+      (write-file (fs/path root "packs" "ui" "index.js") "module.exports = {}\n")
+      (let [result (run {:dir root} (script "swarmforge.bb") "--test-forge-root" (str root))]
+        (is (= "false" (str/trim (:out result)))))
+      (finally
+        (fs/delete-tree root)))))
+
+(deftest forge-host-with-pack-templates-is-a-forge
+  (let [root (tmp-dir)]
+    (try
+      (write-file (fs/path root "packs" "two-pack" "swarmforge" "swarmforge.conf")
+                  "window coder claude master\n")
+      (let [result (run {:dir root} (script "swarmforge.bb") "--test-forge-root" (str root))]
+        (is (= "true" (str/trim (:out result)))))
+      (finally
+        (fs/delete-tree root)))))
+
+(defn backend-fixture
+  "A pack project with the given swarmforge.conf body and optional provider profiles."
+  [conf & providers]
+  (let [root (tmp-dir)]
+    (write-file (fs/path root "swarmforge/constitution.prompt") "Read articles.\n")
+    (write-file (fs/path root "swarmforge/swarmforge.conf") conf)
+    (doseq [role ["coder" "cleaner"]]
+      (write-file (fs/path root "swarmforge/roles" (str role ".prompt")) (str role "\n")))
+    (doseq [p providers]
+      (write-file (fs/path root ".claude" "providers" (str p ".json")) "{\"env\":{}}\n"))
+    root))
+
+(deftest default-backend-uses-swarmforge-default-agent
+  (let [root (backend-fixture "window coder default master\nwindow cleaner default cleaner batch\n")]
+    (try
+      (let [result (run {:dir root :env {"SWARMFORGE_DEFAULT_AGENT" "claude"}}
+                        (script "swarmforge.bb") "--test-parse" (str root))
+            roles (slurp (str (fs/path root ".swarmforge" "roles.tsv")))]
+        (is (zero? (:exit result)))
+        (is (re-find #"(?m)^coder\t.*\tclaude\t" roles))
+        (is (re-find #"(?m)^cleaner\t.*\tclaude\t" roles)))
+      (finally
+        (fs/delete-tree root)))))
+
+(deftest default-backend-without-swarmforge-default-agent-is-rejected
+  (let [root (backend-fixture "window coder default master\n")]
+    (try
+      (let [result (run {:dir root :ok? false} (script "swarmforge.bb") "--test-parse" (str root))]
+        (is (not (zero? (:exit result))))
+        (is (str/includes? (str (:out result) (:err result)) "SWARMFORGE_DEFAULT_AGENT")))
+      (finally
+        (fs/delete-tree root)))))
+
+(deftest provider-adds-settings-file-to-claude-launch
+  (let [root (backend-fixture "window coder claude master provider=deepseek\nwindow cleaner claude cleaner batch\n"
+                              "deepseek")]
+    (try
+      (let [coder (:out (run {:dir root} (script "swarmforge.bb") "--test-role-launch-command" (str root) "coder"))
+            cleaner (:out (run {:dir root} (script "swarmforge.bb") "--test-role-launch-command" (str root) "cleaner"))
+            profile (str (fs/path root ".claude" "providers" "deepseek.json"))]
+        (is (str/includes? coder (str "--settings '" profile "'")))
+        (is (not (str/includes? coder "provider=")))
+        (is (not (str/includes? cleaner "--settings"))))
+      (finally
+        (fs/delete-tree root)))))
+
+(deftest provider-may-appear-before-receive-and-propagation-modes
+  (let [root (backend-fixture "window coder claude master\nwindow cleaner claude cleaner provider=deepseek batch back-one\n"
+                              "deepseek")]
+    (try
+      (let [result (run {:dir root} (script "swarmforge.bb") "--test-parse" (str root))]
+        (is (str/includes? (:out result) "cleaner batch back-one"))
+        (is (str/includes? (:out result) "provider=deepseek")))
+      (finally
+        (fs/delete-tree root)))))
+
+(deftest default-backend-and-provider-work-together
+  (let [root (backend-fixture "window coder default master provider=deepseek\n" "deepseek")]
+    (try
+      (let [out (:out (run {:dir root :env {"SWARMFORGE_DEFAULT_AGENT" "claude"}}
+                           (script "swarmforge.bb") "--test-role-launch-command" (str root) "coder"))]
+        (is (str/starts-with? out "claude\n"))
+        (is (str/includes? out "--settings ")))
+      (finally
+        (fs/delete-tree root)))))
+
+(deftest missing-provider-profile-is-rejected
+  (let [root (backend-fixture "window coder claude master provider=nowhere\n")]
+    (try
+      (let [result (run {:dir root :ok? false} (script "swarmforge.bb") "--test-parse" (str root))]
+        (is (not (zero? (:exit result))))
+        (is (str/includes? (str (:out result) (:err result)) "nowhere.json")))
+      (finally
+        (fs/delete-tree root)))))
+
+(deftest provider-on-a-non-claude-backend-is-rejected
+  (let [root (backend-fixture "window coder codex master provider=deepseek\n" "deepseek")]
+    (try
+      (let [result (run {:dir root :ok? false} (script "swarmforge.bb") "--test-parse" (str root))]
+        (is (not (zero? (:exit result))))
+        (is (str/includes? (str (:out result) (:err result)) "only supported for claude")))
+      (finally
+        (fs/delete-tree root)))))
+
+(deftest lieutenant-falls-back-to-swarmforge-default-agent
+  (let [root (tmp-dir)]
+    (try
+      (let [out (:out (run {:dir root :env {"SWARMFORGE_DEFAULT_AGENT" "claude"}}
+                           (script "swarmforge.bb") "--test-lieutenant-launch-command" (str root)))]
+        (is (str/includes? out "claude --append-system-prompt-file")))
+      (finally
+        (fs/delete-tree root)))))

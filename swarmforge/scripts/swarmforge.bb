@@ -168,6 +168,53 @@
 (def propagation-modes #{"forward-only" "back-one" "back-all"})
 (def known-agents #{"claude" "codex" "copilot" "grok"})
 
+(def default-agent-token "default")
+(def default-agent-env "SWARMFORGE_DEFAULT_AGENT")
+
+(defn default-agent []
+  (some-> (System/getenv default-agent-env) str/trim not-empty str/lower-case))
+
+(defn resolve-agent
+  "A config backend of `default` means the backend named by SWARMFORGE_DEFAULT_AGENT."
+  [agent where]
+  (let [agent (str/lower-case agent)]
+    (if (= agent default-agent-token)
+      (or (default-agent)
+          (config-fail! (str where " uses backend 'default' but " default-agent-env
+                             " is not set (for example: export " default-agent-env "=claude)")))
+      agent)))
+
+(def provider-prefix "provider=")
+
+(defn split-provider
+  "Removes a provider=NAME token from a config line's trailing tokens.
+  Returns [provider-name-or-nil remaining-tokens]."
+  [tokens where]
+  (let [{providers true others false} (group-by #(str/starts-with? % provider-prefix) tokens)]
+    (when (> (count providers) 1)
+      (config-fail! (str where " names more than one provider")))
+    [(some-> (first providers) (subs (count provider-prefix))) (vec others)]))
+
+(defn provider-file [ctx provider]
+  (fs/path (:working-dir ctx) ".claude" "providers" (str provider ".json")))
+
+(defn validate-provider! [ctx provider agent where]
+  (when provider
+    (when-not (re-matches #"[A-Za-z0-9._-]+" provider)
+      (config-fail! (str where " has an invalid provider name '" provider
+                         "': use letters, digits, '.', '_' or '-'")))
+    (when-not (= "claude" agent)
+      (config-fail! (str where " sets provider=" provider " but its backend is '" agent
+                         "'; providers are only supported for claude")))
+    (when-not (fs/regular-file? (provider-file ctx provider))
+      (config-fail! (str where " sets provider=" provider " but "
+                         (provider-file ctx provider) " does not exist")))))
+
+(defn with-provider [ctx row provider]
+  (cond-> row
+    provider (assoc :provider provider
+                    :provider-file (str (fs/absolutize (provider-file ctx provider))))))
+
 (defn receive-fields [trailing]
   (let [[receive-mode after-receive]
         (if (receive-modes (first trailing))
@@ -221,11 +268,16 @@
     (reject-if (< (count fields) 4)
                (str "Invalid config line " line-no ": " line))
     (let [[directive role agent worktree & trailing] fields
-          agent (str/lower-case agent)
+          where (str "Role '" role "' on line " line-no)
+          agent (resolve-agent agent where)
+          [provider trailing] (split-provider trailing where)
           [receive-mode propagation extra-tokens] (receive-fields trailing)
           visible? (visible-window? directive line-no)]
       (validate-window! ctx line-no role agent worktree receive-mode roles worktrees)
-      (window-row ctx role agent worktree receive-mode propagation (extra-args-str extra-tokens) visible?))))
+      (validate-provider! ctx provider agent where)
+      (with-provider ctx
+        (window-row ctx role agent worktree receive-mode propagation (extra-args-str extra-tokens) visible?)
+        provider))))
 
 (defn require-master-worktree! [rows]
   (let [masters (filterv #(= "master" (:worktree-name %)) rows)]
@@ -539,6 +591,14 @@
     "--no-alt-screen "
     ""))
 
+(defn provider-settings-flag
+  "Layers a role's provider profile over the project's .claude settings.
+  Only the file path is typed into tmux, never the key."
+  [row]
+  (if-let [file (:provider-file row)]
+    (str "--settings " (sq file) " ")
+    ""))
+
 (defn launch-command [ctx index row]
   (let [role (:role row)
         agent (:agent row)
@@ -561,6 +621,7 @@
                   "claude" (str (alt-screen-env agent row)
                                 "claude --append-system-prompt-file " (sq (str prompt-file)) " "
                                 (yolo-flag agent row) "-n " (sq (str "SwarmForge " display)) " "
+                                (provider-settings-flag row)
                                 (extra-args-prefix row)
                                 (when initial-prompt? prompt))
                   "codex" (str "codex -C " (sq (str role-worktree)) " "
@@ -858,7 +919,8 @@
       (println (str (:role row) " " (:display-name row) " " (:worktree-path row) " "
                     (:receive-mode row) " " (:propagation row)
                     (when-let [extra (:extra-args row)] (str " " extra))
-                    " " (visibility-label row))))
+                    " " (visibility-label row)
+                    (when-let [provider (:provider row)] (str " provider=" provider)))))
     (print (slurp (str (:roles-file ctx))))
     (print (slurp (str (:sessions-file ctx))))))
 
@@ -938,7 +1000,9 @@
 
 (defn parse-lieutenant-config [ctx]
   (let [file (:config-file ctx)
-        fallback (str/lower-case (or (not-empty (System/getenv "SWARMFORGE_LIEUTENANT_AGENT")) "grok"))]
+        fallback (str/lower-case (or (not-empty (System/getenv "SWARMFORGE_LIEUTENANT_AGENT"))
+                                     (default-agent)
+                                     "grok"))]
     (if-not (fs/regular-file? file)
       {:agent fallback :extra-args nil}
       (or (some (fn [raw]
@@ -947,21 +1011,34 @@
                       (let [fields (str/split line #"\s+")]
                         (when (and (>= (count fields) 2)
                                    (= (str/lower-case (first fields)) "lieutenant"))
-                          (let [agent (str/lower-case (second fields))]
+                          (let [where "Lieutenant"
+                                agent (resolve-agent (second fields) where)
+                                [provider extra] (split-provider (drop 2 fields) where)]
                             (reject-if (not (known-agents agent))
                                        (str "Unsupported agent '" (second fields)
                                             "' for lieutenant"))
+                            (validate-provider! ctx provider agent where)
                             {:agent agent
-                             :extra-args (extra-args-str (drop 2 fields))}))))))
+                             :provider provider
+                             :extra-args (extra-args-str extra)}))))))
                 (str/split-lines (slurp (str file))))
           {:agent fallback :extra-args nil}))))
 
 (defn lieutenant-row [ctx]
-  (let [{:keys [agent extra-args]} (parse-lieutenant-config ctx)]
-    (window-row ctx "lieutenant" agent "master" "task" "forward-only" extra-args false)))
+  (let [{:keys [agent provider extra-args]} (parse-lieutenant-config ctx)]
+    (with-provider ctx
+      (window-row ctx "lieutenant" agent "master" "task" "forward-only" extra-args false)
+      provider)))
 
-(defn forge-root? [root]
-  (fs/directory? (fs/path root "packs")))
+(defn forge-root?
+  "A forge host keeps its SwarmForge templates as packs/<name>/swarmforge/swarmforge.conf.
+  A project's own unrelated packs/ directory does not make it a forge."
+  [root]
+  (let [packs (fs/path root "packs")]
+    (boolean
+     (and (fs/directory? packs)
+          (some #(fs/regular-file? (fs/path % "swarmforge" "swarmforge.conf"))
+                (filter fs/directory? (fs/list-dir packs)))))))
 
 (defn session-names-from-file [ctx]
   (let [file (:sessions-file ctx)]
@@ -1066,6 +1143,14 @@
     (fs/create-dirs (:prompts-dir ctx))
     (println (launch-command ctx 1 row))))
 
+(defn test-role-launch-command! [root role]
+  (let [ctx (assoc (prepare-ctx (context root)) :terminal-backend "none")
+        row (or (first (filter #(= role (:role %)) (:roles ctx)))
+                (fail! (str "No role " role)))]
+    (fs/create-dirs (:prompts-dir ctx))
+    (println (:agent row))
+    (println (launch-command ctx 1 row))))
+
 (defn test-lieutenant-launch-command! [root]
   (let [ctx (assoc (context root) :terminal-backend "none")
         row (assoc (lieutenant-row ctx) :worktree-path (fs/path root))]
@@ -1112,6 +1197,8 @@
                                         (or (second args) (System/getProperty "user.dir")))
     "--test-install-hooks" (test-install-hooks! (second args))
     "--test-link-claude-dir" (test-link-claude-dir! (second args) (nth args 2))
+    "--test-forge-root" (println (forge-root? (second args)))
+    "--test-role-launch-command" (test-role-launch-command! (second args) (nth args 2))
     "--test-agent-start-delay" (println (env-long "SWARMFORGE_AGENT_START_DELAY_MS" 1500))
     "--test-sleep-inhibitor-prefix" (test-sleep-inhibitor-prefix!)
     "--test-ensure-codex-trust" (test-ensure-codex-trust! (second args))
