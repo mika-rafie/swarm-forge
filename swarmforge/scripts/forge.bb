@@ -11,11 +11,24 @@
 (defn sh [& args]
   (apply process/sh args))
 
-(defn forge? [root]
-  (fs/directory? (fs/path root "projects")))
-
 (defn packs-dir [root]
   (fs/path root "packs"))
+
+(defn pack-templates? [root]
+  (let [dir (packs-dir root)]
+    (boolean
+     (or (fs/directory? (fs/path root ".swarmforge" "project-pack"))
+         (and (fs/directory? dir)
+              (some #(fs/regular-file? (fs/path % "swarmforge" "swarmforge.conf"))
+                    (filter fs/directory? (fs/list-dir dir))))))))
+
+(defn forge?
+  "A forge host has projects/ and the pack templates it creates projects from
+  (packs/<name>/ for project-manager, .swarmforge/project-pack for lieutenant).
+  A pack project's own projects/ folder does not make it a forge."
+  [root]
+  (and (fs/directory? (fs/path root "projects"))
+       (pack-templates? root)))
 
 (defn projects-dir [root]
   (fs/path root "projects"))

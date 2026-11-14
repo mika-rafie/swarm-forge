@@ -2542,6 +2542,29 @@
       (is (= ["I'm listing the open projects." "I'll summarize HTW next."]
              (:lieutenant_status state))))))
 
+(deftest pack-project-with-its-own-projects-folder-is-not-a-forge
+  (let [root (tmp-dir)]
+    (fs/create-dirs (fs/path root "projects" "website"))
+    (write-file (fs/path root ".swarmforge/roles.tsv")
+                (format "coder\tmaster\t%s\tswarmforge-coder\tCoder\tclaude\ttask\tforward-only\n" root))
+    (let [state (json/parse-string (:out (pack-web root true "--test-state" (str root))) true)]
+      (is (not (:forge state)))
+      (is (= "coder" (:master_role state))))))
+
+(deftest lieutenant-forge-with-project-pack-template-is-a-forge
+  (let [root (tmp-dir)]
+    (fs/create-dirs (fs/path root "projects"))
+    (write-file (fs/path root ".swarmforge/project-pack/swarmforge/swarmforge.conf")
+                "window coder default master\n")
+    (let [state (json/parse-string (:out (pack-web root true "--test-state" (str root))) true)]
+      (is (true? (:forge state))))))
+
+(deftest project-manager-forge-with-pack-templates-is-a-forge
+  (let [root (tmp-dir)]
+    (seed-mini-forge! root)
+    (let [state (json/parse-string (:out (pack-web root true "--test-state" (str root))) true)]
+      (is (true? (:forge state))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'swarmforge.pack-ui-test)]
     (System/exit (+ fail error))))
